@@ -521,6 +521,43 @@ static int mov_read_wfex(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+static int mov_read_dec3(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    AVStream *st;
+    int eac3info, acmod, lfeon, bsmod;
+    int i, num_ind_sub;
+
+    if (c->fc->nb_streams < 1)
+        return 0;
+    st = c->fc->streams[c->fc->nb_streams-1];
+
+    eac3info = avio_rb16(pb);
+    num_ind_sub = eac3info & 0x7;
+
+    for (i = 0; i <= num_ind_sub; i++)
+    {
+        int num_dep_sub, channels = 0;
+        eac3info = avio_rb24(pb);
+        bsmod       = (eac3info >> 17) & 0x1f;
+        acmod       = (eac3info >> 12) & 0x7;
+        lfeon       = (eac3info >>  9) & 0x1;
+        num_dep_sub = (eac3info >>  1) & 0xf;
+        if (num_dep_sub > 0)
+        {
+            int j;
+            channels += eac3info & 0x1;
+            eac3info = avio_r8(pb);
+            for (j = 0; j < 8; j++)
+                channels += (eac3info >> j) & 0x1;
+        }
+        channels += ((int[]){2,1,2,3,3,4,4,5})[acmod] + lfeon;
+        /* Pick maximum number of channels. */
+        st->codec->channels = FFMAX(st->codec->channels, channels);
+    }
+
+    return 0;
+}
+
 static int mov_read_pasp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
     const int num = avio_rb32(pb);
@@ -2260,6 +2297,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('w','a','v','e'), mov_read_wave },
 { MKTAG('e','s','d','s'), mov_read_esds },
 { MKTAG('d','a','c','3'), mov_read_dac3 }, /* AC-3 info */
+{ MKTAG('d','e','c','3'), mov_read_dec3 }, /* EAC-3 info */
 { MKTAG('w','i','d','e'), mov_read_wide }, /* place holder */
 { MKTAG('w','f','e','x'), mov_read_wfex },
 { MKTAG('c','m','o','v'), mov_read_cmov },
