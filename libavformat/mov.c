@@ -1804,6 +1804,8 @@ static int mov_read_sbgp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     unsigned int i, entries;
     uint8_t version;
     uint32_t grouping_type;
+    unsigned int *group_count;
+    MOVSbgp **group;
 
     if (c->fc->nb_streams < 1)
         return 0;
@@ -1813,26 +1815,77 @@ static int mov_read_sbgp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     version = avio_r8(pb); /* version */
     avio_rb24(pb); /* flags */
     grouping_type = avio_rl32(pb);
-    if (grouping_type != MKTAG( 'r','a','p',' '))
-        return 0; /* only support 'rap ' grouping */
+    if (grouping_type != MKTAG( 'r','a','p',' ') && grouping_type != MKTAG( 'r','o','l','l'))
+        return 0; /* only support 'rap ' and 'roll' grouping */
     if (version == 1)
         avio_rb32(pb); /* grouping_type_parameter */
 
     entries = avio_rb32(pb);
     if (!entries)
         return 0;
-    if (entries >= UINT_MAX / sizeof(*sc->rap_group))
+
+    if (grouping_type == MKTAG( 'r','a','p',' ')) {
+        group_count = &sc->rap_group_count;
+        group = &sc->rap_group;
+    } else {
+        group_count = &sc->roll_group_count;
+        group = &sc->roll_group;
+    }
+
+    if (entries >= UINT_MAX / sizeof(**group))
         return AVERROR_INVALIDDATA;
-    sc->rap_group = av_malloc(entries * sizeof(*sc->rap_group));
-    if (!sc->rap_group)
+    *group = av_malloc(entries * sizeof(**group));
+    if (!*group)
         return AVERROR(ENOMEM);
 
     for (i = 0; i < entries && !pb->eof_reached; i++) {
-        sc->rap_group[i].count = avio_rb32(pb); /* sample_count */
-        sc->rap_group[i].index = avio_rb32(pb); /* group_description_index */
+        (*group)[i].count = avio_rb32(pb); /* sample_count */
+        (*group)[i].index = avio_rb32(pb); /* group_description_index */
     }
 
-    sc->rap_group_count = i;
+    *group_count = i;
+
+    return pb->eof_reached ? AVERROR_EOF : 0;
+}
+
+static int mov_read_sgpd(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    AVStream *st;
+    MOVStreamContext *sc;
+    unsigned int i, entries;
+    uint8_t version;
+    uint32_t grouping_type;
+    uint32_t default_length;
+
+    if (c->fc->nb_streams < 1)
+        return 0;
+    st = c->fc->streams[c->fc->nb_streams-1];
+    sc = st->priv_data;
+
+    version = avio_r8(pb);
+    avio_rb24(pb); /* flags */
+
+    grouping_type = avio_rl32(pb);
+    if (grouping_type != MKTAG( 'r','o','l','l'))
+        return 0; /* only support 'roll' grouping */
+
+    default_length = version == 1 ? avio_rb32(pb) : 0;
+    if (version == 1 && default_length != 2)
+        return 0; /* unknown length of 'roll' grouping */
+
+    entries = avio_rb32(pb);
+    if (!entries)
+        return 0;
+    if (entries >= UINT_MAX / sizeof(*sc->roll_distances))
+        return AVERROR_INVALIDDATA;
+    sc->roll_distances = av_malloc(entries * sizeof(*sc->roll_distances));
+    if (!sc->roll_distances)
+        return AVERROR(ENOMEM);
+
+    for (i = 0; i < entries && !pb->eof_reached; i++)
+        sc->roll_distances[i] = avio_rb16(pb);
+
+    sc->roll_desc_count = i;
 
     return pb->eof_reached ? AVERROR_EOF : 0;
 }
@@ -1873,8 +1926,21 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
         unsigned int distance = 0;
         unsigned int rap_group_index = 0;
         unsigned int rap_group_sample = 0;
+        unsigned int roll_group_index = 0;
+        unsigned int roll_group_sample = 0;
+        unsigned int recovery_distance = 0;
         int rap_group_present = sc->rap_group_count && sc->rap_group;
+        int recovery = 0;
+        int recovery_present = sc->roll_distances && sc->roll_group_count && sc->roll_group;
         int key_off = (sc->keyframes && sc->keyframes[0] > 0) || (sc->stps_data && sc->stps_data[0] > 0);
+
+        if (recovery_present) {
+            unsigned int desc_index = sc->roll_group[roll_group_index].index;
+            if (desc_index > 0 && desc_index <= sc->roll_desc_count) {
+                recovery = sc->roll_distances[desc_index - 1];
+                recovery_distance = 0;
+            }
+        }
 
         current_dts -= sc->dts_shift;
 
@@ -1921,6 +1987,26 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                 }
                 if (keyframe)
                     distance = 0;
+                if (recovery_present) {
+                    int recovery_start = 0;
+                    if (roll_group_index + 1 < sc->roll_group_count && roll_group_sample == sc->roll_group[roll_group_index].count) {
+                        unsigned int desc_index;
+                        roll_group_sample = 0;
+                        roll_group_index++;
+                        desc_index = sc->roll_group[roll_group_index].index;
+                        if (desc_index > 0 && desc_index <= sc->roll_desc_count) {
+                            recovery = sc->roll_distances[desc_index - 1];
+                            recovery_distance = 0;
+                            recovery_start = 1;
+                        }
+                    }
+                    if (keyframe)
+                        recovery = 0;
+                    if (recovery_start)
+                        keyframe = 1;
+                    else if (recovery > 0)
+                        recovery--;
+                }
                 sample_size = sc->sample_size > 0 ? sc->sample_size : sc->sample_sizes[current_sample];
                 if (sc->pseudo_stream_id == -1 ||
                    sc->stsc_data[stsc_index].id - 1 == sc->pseudo_stream_id) {
@@ -1928,7 +2014,7 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                     e->pos = current_offset;
                     e->timestamp = current_dts;
                     e->size = sample_size;
-                    e->min_distance = distance;
+                    e->min_distance = recovery_present && recovery == 0 ? FFMIN(distance, recovery_distance) : distance;
                     e->flags = keyframe ? AVINDEX_KEYFRAME : 0;
                     av_dlog(mov->fc, "AVIndex stream %d, sample %d, offset %"PRIx64", dts %"PRId64", "
                             "size %d, distance %d, keyframe %d\n", st->index, current_sample,
@@ -1941,6 +2027,10 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                 distance++;
                 stts_sample++;
                 current_sample++;
+                if (recovery_present) {
+                    roll_group_sample++;
+                    recovery_distance++;
+                }
                 if (stts_index + 1 < sc->stts_count && stts_sample == sc->stts_data[stts_index].count) {
                     stts_sample = 0;
                     stts_index++;
@@ -2166,6 +2256,8 @@ static int mov_read_trak(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     av_freep(&sc->stts_data);
     av_freep(&sc->stps_data);
     av_freep(&sc->rap_group);
+    av_freep(&sc->roll_distances);
+    av_freep(&sc->roll_group);
 
     return 0;
 }
@@ -2609,6 +2701,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('d','v','c','1'), mov_read_dvc1 },
 { MKTAG('s','b','g','p'), mov_read_sbgp },
 { MKTAG('h','v','c','C'), mov_read_glbl },
+{ MKTAG('s','g','p','d'), mov_read_sgpd },
 { 0, NULL }
 };
 
