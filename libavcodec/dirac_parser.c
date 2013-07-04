@@ -147,6 +147,7 @@ static int dirac_combine_frame(AVCodecParserContext *s, AVCodecContext *avctx,
     } else {
         /* Found a possible frame start and a  possible frame end */
         DiracParseUnit pu1, pu;
+        uint8_t *cur_pu;
         void *new_buffer = av_fast_realloc(pc->buffer, &pc->buffer_size,
                                            pc->index + next);
         pc->buffer = new_buffer;
@@ -171,9 +172,9 @@ static int dirac_combine_frame(AVCodecParserContext *s, AVCodecContext *avctx,
         /* All non-frame data must be accompanied by frame data. This is to
          * ensure that pts is set correctly. So if the current parse unit is
          * not frame data, wait for frame data to come along */
+        cur_pu = pc->buffer + pc->index - 13 - pu1.prev_pu_offset;
 
-        pc->dirac_unit = pc->buffer + pc->index - 13 -
-                         pu1.prev_pu_offset - pc->dirac_unit_size;
+        pc->dirac_unit = cur_pu - pc->dirac_unit_size;
 
         pc->dirac_unit_size += pu.next_pu_offset;
 
@@ -184,10 +185,9 @@ static int dirac_combine_frame(AVCodecParserContext *s, AVCodecContext *avctx,
         }
 
         /* Get the picture number to set the pts and dts*/
+        s->output_picture_number = AV_RB32(cur_pu + 13);
         if (parse_timing_info) {
-            uint8_t *cur_pu = pc->buffer +
-                              pc->index - 13 - pu1.prev_pu_offset;
-            int pts =  AV_RB32(cur_pu + 13);
+            int pts = s->output_picture_number;
             if (s->last_pts == 0 && s->last_dts == 0)
                 s->dts = pts - 1;
             else
