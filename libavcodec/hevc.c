@@ -3106,7 +3106,7 @@ static int hevc_update_thread_context(AVCodecContext *dst,
     return 0;
 }
 
-static int hevc_decode_extradata(HEVCContext *s)
+int ff_hevc_decode_extradata(HEVCContext *s)
 {
     AVCodecContext *avctx = s->avctx;
     GetByteContext gb;
@@ -3184,7 +3184,7 @@ static av_cold int hevc_decode_init(AVCodecContext *avctx)
         return ret;
 
     if (avctx->extradata_size > 0 && avctx->extradata) {
-        ret = hevc_decode_extradata(s);
+        ret = ff_hevc_decode_extradata(s);
         if (ret < 0) {
             hevc_decode_free(avctx);
             return ret;

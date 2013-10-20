@@ -869,6 +869,8 @@ int ff_hevc_decode_nal_sei(HEVCContext *s);
 int ff_hevc_extract_rbsp(const uint8_t *src, int length,
                          HEVCNAL *nal);
 
+int ff_hevc_decode_extradata(HEVCContext *s);
+
 /**
  * Mark all frames in DPB as unused for reference.
  */

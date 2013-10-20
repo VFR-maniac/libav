@@ -31,6 +31,8 @@
 typedef struct HEVCParseContext {
     HEVCContext  h;
     ParseContext pc;
+    uint8_t *extradata;
+    int extradata_size;
 } HEVCParseContext;
 
 /**
@@ -40,34 +42,55 @@ typedef struct HEVCParseContext {
 static int hevc_find_frame_end(AVCodecParserContext *s, const uint8_t *buf,
                                int buf_size)
 {
-    int i;
+    int i, start;
+    HEVCContext  *h  = &((HEVCParseContext *)s->priv_data)->h;
     ParseContext *pc = &((HEVCParseContext *)s->priv_data)->pc;
 
     for (i = 0; i < buf_size; i++) {
         int nut;
 
-        pc->state64 = (pc->state64 << 8) | buf[i];
+        if (h->is_nalff) {
+            int j;
+            int nal_length = 0;
 
-        if (((pc->state64 >> 3 * 8) & 0xFFFFFF) != START_CODE)
-            continue;
+            if (i + h->nal_length_size >= buf_size)
+                return END_NOT_FOUND;
 
-        nut = (pc->state64 >> 2 * 8 + 1) & 0x3F;
+            start = i;
+            for (j = 0; j < h->nal_length_size; j++)
+                nal_length = (nal_length << 8) | buf[i++];
+
+            if (i + nal_length > buf_size)
+                return END_NOT_FOUND;
+
+            nut = (buf[i] >> 1) & 0x3F;
+            i += nal_length - 1;
+        } else {
+            pc->state64 = (pc->state64 << 8) | buf[i];
+
+            if (((pc->state64 >> 3 * 8) & 0xFFFFFF) != START_CODE)
+                continue;
+
+            nut = (pc->state64 >> 2 * 8 + 1) & 0x3F;
+            start = i - 5;
+        }
+
         // Beginning of access unit
         if ((nut >= NAL_VPS && nut <= NAL_AUD) || nut == NAL_SEI_PREFIX ||
             (nut >= 41 && nut <= 44) || (nut >= 48 && nut <= 55)) {
             if (pc->frame_start_found) {
                 pc->frame_start_found = 0;
-                return i - 5;
+                return start;
             }
         } else if (nut <= NAL_RASL_R ||
                    (nut >= NAL_BLA_W_LP && nut <= NAL_CRA_NUT)) {
-            int first_slice_segment_in_pic_flag = buf[i] >> 7;
+            int first_slice_segment_in_pic_flag = buf[h->is_nalff ? start + h->nal_length_size + 2 : i] >> 7;
             if (first_slice_segment_in_pic_flag) {
                 if (!pc->frame_start_found) {
                     pc->frame_start_found = 1;
                 } else { // First slice of next frame found
                     pc->frame_start_found = 0;
-                    return i - 5;
+                    return start;
                 }
             }
         }
@@ -117,11 +140,24 @@ static inline int parse_nal_units(AVCodecParserContext *s,
     nal = &h->nals[0];
 
     for (;;) {
-        int src_length, consumed;
-        buf = avpriv_find_start_code(buf, buf_end, &state);
-        if (--buf + 2 >= buf_end)
-            break;
-        src_length = buf_end - buf;
+        int nal_length, src_length, consumed;
+
+        if (h->is_nalff) {
+            int i;
+            if (buf + h->nal_length_size >= buf_end)
+                break;
+            nal_length = 0;
+            for (i = 0; i < h->nal_length_size; i++)
+                nal_length = (nal_length << 8) | *(buf++);
+            if (nal_length <= 2 || buf + nal_length > buf_end)
+                break;
+            src_length = nal_length;
+        } else {
+            buf = avpriv_find_start_code(buf, buf_end, &state);
+            if (--buf + 2 >= buf_end)
+                break;
+            src_length = buf_end - buf;
+        }
 
         h->nal_unit_type = (*buf >> 1) & 0x3f;
         h->temporal_id   = (*(buf + 1) & 0x07) - 1;
@@ -249,7 +285,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
 
             return 0; /* no need to evaluate the rest */
         }
-        buf += consumed;
+        buf += h->is_nalff ? nal_length : consumed;
     }
     /* didn't find a picture! */
     av_log(h->avctx, AV_LOG_ERROR, "missing picture in access unit\n");
@@ -261,7 +297,22 @@ static int hevc_parse(AVCodecParserContext *s, AVCodecContext *avctx,
                       const uint8_t *buf, int buf_size)
 {
     int next;
-    ParseContext *pc = &((HEVCParseContext *)s->priv_data)->pc;
+    HEVCParseContext *hpc = (HEVCParseContext *)s->priv_data;
+    ParseContext     *pc  = &hpc->pc;
+
+    if (hpc->extradata_size != avctx->extradata_size ||
+        (hpc->extradata && avctx->extradata &&
+         memcmp(hpc->extradata, avctx->extradata, avctx->extradata_size))) {
+        uint8_t *temp = av_realloc(hpc->extradata, avctx->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE);
+        if (temp) {
+            hpc->extradata      = temp;
+            hpc->extradata_size = avctx->extradata_size;
+            memcpy(hpc->extradata, avctx->extradata, hpc->extradata_size);
+
+            hpc->h.avctx = avctx;
+            ff_hevc_decode_extradata(&hpc->h);
+        }
+    }
 
     if (s->flags & PARSER_FLAG_COMPLETE_FRAMES) {
         next = buf_size;
@@ -306,10 +357,13 @@ static int hevc_split(AVCodecContext *avctx, const uint8_t *buf, int buf_size)
 static void close(AVCodecParserContext *s)
 {
     int i;
-    HEVCContext  *h  = &((HEVCParseContext *)s->priv_data)->h;
-    ParseContext *pc = &((HEVCParseContext *)s->priv_data)->pc;
+    HEVCParseContext *hpc = (HEVCParseContext *)s->priv_data;
+    HEVCContext      *h   = &hpc->h;
+    ParseContext     *pc  = &hpc->pc;
 
     av_freep(&pc->buffer);
+
+    av_freep(&hpc->extradata);
 
     for (i = 0; i < FF_ARRAY_ELEMS(h->vps_list); i++)
         av_freep(&h->vps_list[i]);
