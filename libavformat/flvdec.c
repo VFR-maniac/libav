@@ -215,6 +215,8 @@ static int flv_same_video_codec(AVCodecContext *vcodec, int flags)
         return vcodec->codec_id == AV_CODEC_ID_VP6A;
     case FLV_CODECID_H264:
         return vcodec->codec_id == AV_CODEC_ID_H264;
+    case FLV_CODECID_HM10:
+        return vcodec->codec_id == AV_CODEC_ID_HEVC;
     default:
         return vcodec->codec_tag == flv_codecid;
     }
@@ -253,6 +255,9 @@ static int flv_set_video_codec(AVFormatContext *s, AVStream *vstream,
         return 1;     // 1 byte body size adjustment for flv_read_packet()
     case FLV_CODECID_H264:
         vcodec->codec_id = AV_CODEC_ID_H264;
+        return 3;     // not 4, reading packet type will consume one byte
+    case FLV_CODECID_HM10:
+        vcodec->codec_id = AV_CODEC_ID_HEVC;
         return 3;     // not 4, reading packet type will consume one byte
     default:
         av_log(s, AV_LOG_INFO, "Unsupported video codec (%x)\n", flv_codecid);
@@ -629,6 +634,53 @@ static void clear_index_entries(AVFormatContext *s, int64_t pos)
     }
 }
 
+static int flv_make_fake_hvcc(uint8_t **extradata, int *size)
+{
+    int i, cnt;
+    uint8_t *avcc;
+    uint8_t *hvcc;
+    uint8_t *hvcc_org = av_mallocz(*size + 22 +
+                                   FF_INPUT_BUFFER_PADDING_SIZE);
+    if (!hvcc_org)
+        return AVERROR(ENOMEM);
+
+    hvcc = hvcc_org + 21;
+    avcc = *extradata + 4;
+
+    *hvcc_org = 1; /* configurationVersion */
+    *(hvcc++) = *(avcc++) & 0x03; /* lengthSizeMinusOne */
+    *(hvcc++) = 2; /* numOfArrays */
+
+    /* SPS */
+    *(hvcc++) = 33;
+    cnt = *(avcc++) & 0x1f;
+    *(hvcc++) = 0;
+    *(hvcc++) = cnt;
+    for (i = 0; i < cnt; i++) {
+        int nalsize = AV_RB16(avcc) + 2;
+        memcpy(hvcc, avcc, nalsize);
+        hvcc += nalsize;
+        avcc += nalsize;
+    }
+
+    /* PPS */
+    *(hvcc++) = 34;
+    cnt = *(avcc++);
+    *(hvcc++) = 0;
+    *(hvcc++) = cnt;
+    for (i = 0; i < cnt; i++) {
+        int nalsize = AV_RB16(avcc) + 2;
+        memcpy(hvcc, avcc, nalsize);
+        hvcc += nalsize;
+        avcc += nalsize;
+    }
+
+    av_free(*extradata);
+    *extradata = hvcc_org;
+    *size      = hvcc - hvcc_org;
+    return 0;
+}
+
 static int amf_skip_tag(AVIOContext *pb, AMFDataType type)
 {
     int nb = -1, ret, parse_name = 1;
@@ -890,11 +942,13 @@ skip:
         size -= flv_set_video_codec(s, st, flags & FLV_VIDEO_CODECID_MASK, 1);
     }
 
-    if (st->codec->codec_id == AV_CODEC_ID_AAC ||
-        st->codec->codec_id == AV_CODEC_ID_H264) {
+    if (st->codec->codec_id == AV_CODEC_ID_AAC  ||
+        st->codec->codec_id == AV_CODEC_ID_H264 ||
+        st->codec->codec_id == AV_CODEC_ID_HEVC) {
         int type = avio_r8(s->pb);
         size--;
-        if (st->codec->codec_id == AV_CODEC_ID_H264) {
+        if (st->codec->codec_id == AV_CODEC_ID_H264 ||
+            st->codec->codec_id == AV_CODEC_ID_HEVC) {
             // sign extension
             int32_t cts = (avio_rb24(s->pb) + 0xff800000) ^ 0xff800000;
             pts = dts + cts;
@@ -908,11 +962,21 @@ skip:
             if (st->codec->extradata) {
                 if ((ret = flv_queue_extradata(flv, s->pb, is_audio, size)) < 0)
                     return ret;
+                if (st->codec->codec_id == AV_CODEC_ID_HEVC) {
+                    if ((ret = flv_make_fake_hvcc(&flv->new_extradata[is_audio],
+                                                  &flv->new_extradata_size[is_audio])) < 0)
+                        return ret;
+                }
                 ret = AVERROR(EAGAIN);
                 goto leave;
             }
             if ((ret = flv_get_extradata(s, st, size)) < 0)
                 return ret;
+            if (st->codec->codec_id == AV_CODEC_ID_HEVC) {
+                if ((ret = flv_make_fake_hvcc(&st->codec->extradata,
+                                              &st->codec->extradata_size)) < 0)
+                    return ret;
+            }
             if (st->codec->codec_id == AV_CODEC_ID_AAC) {
                 MPEG4AudioConfig cfg;
 
