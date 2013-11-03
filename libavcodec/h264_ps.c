@@ -180,7 +180,10 @@ static inline int decode_vui_parameters(H264Context *h, SPS *sps)
         /* chroma_sample_location_type_top_field */
         h->avctx->chroma_sample_location = get_ue_golomb(&h->gb) + 1;
         get_ue_golomb(&h->gb);  /* chroma_sample_location_type_bottom_field */
-    }
+    } else if (sps->chroma_format_idc == 1)
+        h->avctx->chroma_sample_location = AVCHROMA_LOC_LEFT;
+    else
+        h->avctx->chroma_sample_location = AVCHROMA_LOC_UNSPECIFIED;
 
     sps->timing_info_present_flag = get_bits1(&h->gb);
     if (sps->timing_info_present_flag) {
