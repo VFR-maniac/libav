@@ -418,6 +418,13 @@ static int set_sps(HEVCContext *s, const HEVCSPS *sps)
         s->avctx->colorspace      = AVCOL_SPC_UNSPECIFIED;
     }
 
+    if (sps->vui.chroma_loc_info_present_flag)
+        s->avctx->chroma_sample_location = sps->vui.chroma_sample_loc_type_top_field + 1;
+    else if (sps->chroma_format_idc == 1)
+        s->avctx->chroma_sample_location = AVCHROMA_LOC_LEFT;
+    else
+        s->avctx->chroma_sample_location = AVCHROMA_LOC_UNSPECIFIED;
+
     ff_hevc_pred_init(&s->hpc,     sps->bit_depth);
     ff_hevc_dsp_init (&s->hevcdsp, sps->bit_depth);
     ff_videodsp_init (&s->vdsp,    sps->bit_depth);
